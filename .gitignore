@@ -1,0 +1,29 @@
+# Compiled object files
+*.o
+*.obj
+
+# Executables
+retroshield
+retroshield_tui
+retroshield_nc
+
+# Libraries
+*.a
+*.so
+*.dylib
+
+# Debug files
+*.dSYM/
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Build directories
+build/

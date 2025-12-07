@@ -1,0 +1,765 @@
+/*
+ * RetroShield Z80 Emulator - Notcurses TUI
+ * Modern TUI debugger using notcurses library
+ *
+ * Copyright (c) 2025 Alex Jokela
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <locale.h>
+#include <time.h>
+#include <unistd.h>
+#include <termios.h>
+
+#include <notcurses/notcurses.h>
+#include "z80.h"
+#include "z80_disasm.h"
+
+/* Memory configuration */
+#define ROM_SIZE 0x2000
+#define RAM_START 0x2000
+#define RAM_SIZE 0x6000
+#define MEM_SIZE 0x8000
+
+/* MC6850 ACIA ports */
+#define ACIA_CTRL 0x80
+#define ACIA_DATA 0x81
+#define ACIA_RDRF 0x01
+#define ACIA_TDRE 0x02
+
+/* Terminal buffer */
+#define TERM_COLS 80
+#define TERM_ROWS 24
+#define TERM_BUF_SIZE (TERM_COLS * TERM_ROWS)
+
+/* Input buffer for emulated system */
+#define INPUT_BUF_SIZE 256
+
+/* Global state */
+static uint8_t memory[MEM_SIZE];
+static z80 cpu;
+
+/* Terminal emulation state */
+static char term_buffer[TERM_BUF_SIZE];
+static int term_cursor_x = 0;
+static int term_cursor_y = 0;
+
+/* Input buffer (keys to send to emulated system) */
+static char input_buffer[INPUT_BUF_SIZE];
+static int input_head = 0;
+static int input_tail = 0;
+
+/* Emulator state */
+static bool running = false;
+static bool paused = true;
+static int cycles_per_frame = 50000;
+static unsigned long total_cycles = 0;
+static uint16_t mem_view_addr = 0x0000;
+
+/* Notcurses state */
+static struct notcurses *nc = NULL;
+static struct ncplane *stdp = NULL;
+static struct ncplane *reg_plane = NULL;
+static struct ncplane *dis_plane = NULL;
+static struct ncplane *mem_plane = NULL;
+static struct ncplane *term_plane = NULL;
+static struct ncplane *help_plane = NULL;
+static struct ncplane *status_plane = NULL;
+
+/* Colors */
+#define COL_BORDER    0x4488cc
+#define COL_TITLE     0x88ccff
+#define COL_LABEL     0x888888
+#define COL_VALUE     0xffffff
+#define COL_CHANGED   0xff8844
+#define COL_PC        0x44ff44
+#define COL_ADDR      0x888888
+#define COL_OPCODE    0xcccccc
+#define COL_MNEMONIC  0xffffff
+#define COL_HEX       0x88aacc
+#define COL_ASCII     0xaaccaa
+#define COL_CURSOR    0xffff00
+#define COL_STATUS_RUN  0x44ff44
+#define COL_STATUS_PAUSE 0xffaa00
+#define COL_STATUS_HALT  0xff4444
+#define COL_HELP_KEY  0xffcc44
+#define COL_HELP_DESC 0xaaaaaa
+
+/* Previous register values for change highlighting */
+static uint16_t prev_pc, prev_sp, prev_ix, prev_iy;
+static uint8_t prev_a, prev_b, prev_c, prev_d, prev_e, prev_h, prev_l;
+static uint8_t prev_flags;
+
+/* Forward declarations */
+static void term_putchar(char c);
+static bool input_available(void);
+static char input_getchar(void);
+
+/* Memory callbacks */
+static uint8_t mem_read(void *userdata, uint16_t addr) {
+    (void)userdata;
+    return (addr < MEM_SIZE) ? memory[addr] : 0xFF;
+}
+
+static void mem_write(void *userdata, uint16_t addr, uint8_t val) {
+    (void)userdata;
+    if (addr >= RAM_START && addr < MEM_SIZE) {
+        memory[addr] = val;
+    }
+}
+
+static uint8_t port_in(z80 *z, uint8_t port) {
+    (void)z;
+    if (port == ACIA_CTRL) {
+        uint8_t status = ACIA_TDRE;
+        if (input_available()) status |= ACIA_RDRF;
+        return status;
+    } else if (port == ACIA_DATA) {
+        return input_available() ? input_getchar() : 0;
+    }
+    return 0xFF;
+}
+
+static void port_out(z80 *z, uint8_t port, uint8_t val) {
+    (void)z;
+    if (port == ACIA_DATA) {
+        term_putchar(val);
+    }
+}
+
+/* Terminal emulation */
+static void term_clear(void) {
+    memset(term_buffer, ' ', TERM_BUF_SIZE);
+    term_cursor_x = 0;
+    term_cursor_y = 0;
+}
+
+static void term_scroll(void) {
+    memmove(term_buffer, term_buffer + TERM_COLS, TERM_COLS * (TERM_ROWS - 1));
+    memset(term_buffer + TERM_COLS * (TERM_ROWS - 1), ' ', TERM_COLS);
+}
+
+static void term_putchar(char c) {
+    if (c == '\r') {
+        term_cursor_x = 0;
+    } else if (c == '\n') {
+        term_cursor_y++;
+        if (term_cursor_y >= TERM_ROWS) {
+            term_scroll();
+            term_cursor_y = TERM_ROWS - 1;
+        }
+    } else if (c == '\b') {
+        if (term_cursor_x > 0) term_cursor_x--;
+    } else if (c >= 32 && c < 127) {
+        int idx = term_cursor_y * TERM_COLS + term_cursor_x;
+        if (idx < TERM_BUF_SIZE) {
+            term_buffer[idx] = c;
+        }
+        term_cursor_x++;
+        if (term_cursor_x >= TERM_COLS) {
+            term_cursor_x = 0;
+            term_cursor_y++;
+            if (term_cursor_y >= TERM_ROWS) {
+                term_scroll();
+                term_cursor_y = TERM_ROWS - 1;
+            }
+        }
+    }
+}
+
+/* Input buffer */
+static bool input_available(void) {
+    return input_head != input_tail;
+}
+
+static char input_getchar(void) {
+    if (input_head == input_tail) return 0;
+    char c = input_buffer[input_tail];
+    input_tail = (input_tail + 1) % INPUT_BUF_SIZE;
+    return c;
+}
+
+static void input_putchar(char c) {
+    int next = (input_head + 1) % INPUT_BUF_SIZE;
+    if (next != input_tail) {
+        input_buffer[input_head] = c;
+        input_head = next;
+    }
+}
+
+/* ROM loading */
+static int load_rom(const char *filename) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) return -1;
+    size_t bytes = fread(memory, 1, ROM_SIZE, f);
+    fclose(f);
+    return (bytes > 0) ? 0 : -1;
+}
+
+/* Get flags as byte */
+static uint8_t get_flags(void) {
+    return (cpu.sf << 7) | (cpu.zf << 6) | (cpu.yf << 5) | (cpu.hf << 4) |
+           (cpu.xf << 3) | (cpu.pf << 2) | (cpu.nf << 1) | cpu.cf;
+}
+
+/* Draw a box with title using Unicode box-drawing chars */
+static void draw_box(struct ncplane *p, const char *title) {
+    unsigned rows, cols;
+    ncplane_dim_yx(p, &rows, &cols);
+
+    ncplane_set_fg_rgb(p, COL_BORDER);
+
+    /* Draw corners and edges */
+    ncplane_putstr_yx(p, 0, 0, "╭");
+    ncplane_putstr_yx(p, 0, cols - 1, "╮");
+    ncplane_putstr_yx(p, rows - 1, 0, "╰");
+    ncplane_putstr_yx(p, rows - 1, cols - 1, "╯");
+
+    for (unsigned x = 1; x < cols - 1; x++) {
+        ncplane_putstr_yx(p, 0, x, "─");
+        ncplane_putstr_yx(p, rows - 1, x, "─");
+    }
+    for (unsigned y = 1; y < rows - 1; y++) {
+        ncplane_putstr_yx(p, y, 0, "│");
+        ncplane_putstr_yx(p, y, cols - 1, "│");
+    }
+
+    /* Title */
+    if (title) {
+        ncplane_set_fg_rgb(p, COL_TITLE);
+        int title_x = (cols - strlen(title) - 4) / 2;
+        if (title_x < 2) title_x = 2;
+        ncplane_printf_yx(p, 0, title_x, "┤ %s ├", title);
+    }
+}
+
+/* Draw registers panel */
+static void draw_registers(void) {
+    ncplane_erase(reg_plane);
+    draw_box(reg_plane, "Registers");
+
+    uint8_t flags = get_flags();
+
+    /* Main registers */
+    int y = 1;
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 2, "PC");
+    ncplane_set_fg_rgb(reg_plane, (cpu.pc != prev_pc) ? COL_CHANGED : COL_PC);
+    ncplane_printf_yx(reg_plane, y, 5, "%04X", cpu.pc);
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 11, "SP");
+    ncplane_set_fg_rgb(reg_plane, (cpu.sp != prev_sp) ? COL_CHANGED : COL_VALUE);
+    ncplane_printf_yx(reg_plane, y++, 14, "%04X", cpu.sp);
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 2, "AF");
+    ncplane_set_fg_rgb(reg_plane, (cpu.a != prev_a || flags != prev_flags) ? COL_CHANGED : COL_VALUE);
+    ncplane_printf_yx(reg_plane, y, 5, "%02X%02X", cpu.a, flags);
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 11, "BC");
+    ncplane_set_fg_rgb(reg_plane, (cpu.b != prev_b || cpu.c != prev_c) ? COL_CHANGED : COL_VALUE);
+    ncplane_printf_yx(reg_plane, y++, 14, "%02X%02X", cpu.b, cpu.c);
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 2, "DE");
+    ncplane_set_fg_rgb(reg_plane, (cpu.d != prev_d || cpu.e != prev_e) ? COL_CHANGED : COL_VALUE);
+    ncplane_printf_yx(reg_plane, y, 5, "%02X%02X", cpu.d, cpu.e);
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 11, "HL");
+    ncplane_set_fg_rgb(reg_plane, (cpu.h != prev_h || cpu.l != prev_l) ? COL_CHANGED : COL_VALUE);
+    ncplane_printf_yx(reg_plane, y++, 14, "%02X%02X", cpu.h, cpu.l);
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 2, "IX");
+    ncplane_set_fg_rgb(reg_plane, (cpu.ix != prev_ix) ? COL_CHANGED : COL_VALUE);
+    ncplane_printf_yx(reg_plane, y, 5, "%04X", cpu.ix);
+
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 11, "IY");
+    ncplane_set_fg_rgb(reg_plane, (cpu.iy != prev_iy) ? COL_CHANGED : COL_VALUE);
+    ncplane_printf_yx(reg_plane, y++, 14, "%04X", cpu.iy);
+
+    /* Flags */
+    ncplane_set_fg_rgb(reg_plane, COL_LABEL);
+    ncplane_putstr_yx(reg_plane, y, 2, "Flags:");
+    ncplane_set_fg_rgb(reg_plane, COL_VALUE);
+    ncplane_printf_yx(reg_plane, y, 9, "%c%c%c%c%c%c%c%c",
+        cpu.sf ? 'S' : '-', cpu.zf ? 'Z' : '-',
+        cpu.yf ? 'Y' : '-', cpu.hf ? 'H' : '-',
+        cpu.xf ? 'X' : '-', cpu.pf ? 'P' : '-',
+        cpu.nf ? 'N' : '-', cpu.cf ? 'C' : '-');
+}
+
+/* Draw disassembly panel */
+static void draw_disassembly(void) {
+    ncplane_erase(dis_plane);
+    draw_box(dis_plane, "Disassembly");
+
+    unsigned rows, cols;
+    ncplane_dim_yx(dis_plane, &rows, &cols);
+
+    uint16_t addr = cpu.pc;
+    char buf[64];
+
+    for (unsigned y = 1; y < rows - 1 && addr < MEM_SIZE; y++) {
+        int len = z80_disasm(memory, addr, buf, sizeof(buf));
+
+        /* Highlight current PC */
+        bool is_pc = (addr == cpu.pc);
+
+        /* Address */
+        ncplane_set_fg_rgb(dis_plane, is_pc ? COL_PC : COL_ADDR);
+        if (is_pc) {
+            ncplane_putstr_yx(dis_plane, y, 2, "▶");
+        }
+        ncplane_printf_yx(dis_plane, y, 4, "%04X", addr);
+
+        /* Opcodes (up to 4 bytes) */
+        ncplane_set_fg_rgb(dis_plane, COL_OPCODE);
+        int x = 9;
+        for (int i = 0; i < len && i < 4; i++) {
+            ncplane_printf_yx(dis_plane, y, x, "%02X", memory[(addr + i) & 0xFFFF]);
+            x += 3;
+        }
+
+        /* Mnemonic */
+        ncplane_set_fg_rgb(dis_plane, is_pc ? COL_PC : COL_MNEMONIC);
+        ncplane_printf_yx(dis_plane, y, 22, "%-20s", buf);
+
+        addr += len;
+    }
+}
+
+/* Draw memory panel */
+static void draw_memory(void) {
+    ncplane_erase(mem_plane);
+    draw_box(mem_plane, "Memory");
+
+    unsigned rows, cols;
+    ncplane_dim_yx(mem_plane, &rows, &cols);
+
+    uint16_t addr = mem_view_addr;
+
+    for (unsigned y = 1; y < rows - 1; y++) {
+        /* Address */
+        ncplane_set_fg_rgb(mem_plane, COL_ADDR);
+        ncplane_printf_yx(mem_plane, y, 2, "%04X:", addr);
+
+        /* Hex bytes */
+        ncplane_set_fg_rgb(mem_plane, COL_HEX);
+        for (int i = 0; i < 16 && (addr + i) < 0x10000; i++) {
+            uint16_t a = (addr + i) & 0xFFFF;
+            if (a == cpu.pc) {
+                ncplane_set_fg_rgb(mem_plane, COL_PC);
+            } else if (a == cpu.sp) {
+                ncplane_set_fg_rgb(mem_plane, COL_CHANGED);
+            } else {
+                ncplane_set_fg_rgb(mem_plane, COL_HEX);
+            }
+            ncplane_printf_yx(mem_plane, y, 8 + i * 3, "%02X",
+                             (a < MEM_SIZE) ? memory[a] : 0xFF);
+        }
+
+        /* ASCII */
+        ncplane_set_fg_rgb(mem_plane, COL_ASCII);
+        ncplane_putstr_yx(mem_plane, y, 57, "│");
+        for (int i = 0; i < 16 && (addr + i) < 0x10000; i++) {
+            uint16_t a = (addr + i) & 0xFFFF;
+            uint8_t c = (a < MEM_SIZE) ? memory[a] : 0xFF;
+            char ch = (c >= 32 && c < 127) ? c : '.';
+            ncplane_printf_yx(mem_plane, y, 58 + i, "%c", ch);
+        }
+
+        addr += 16;
+    }
+}
+
+/* Draw terminal panel */
+static void draw_terminal(void) {
+    ncplane_erase(term_plane);
+    draw_box(term_plane, "Terminal");
+
+    for (int y = 0; y < TERM_ROWS; y++) {
+        char line[TERM_COLS + 1];
+        memcpy(line, term_buffer + y * TERM_COLS, TERM_COLS);
+        line[TERM_COLS] = '\0';
+
+        ncplane_set_fg_rgb(term_plane, COL_VALUE);
+        ncplane_putstr_yx(term_plane, y + 1, 1, line);
+    }
+
+    /* Draw cursor */
+    ncplane_set_fg_rgb(term_plane, COL_CURSOR);
+    ncplane_putstr_yx(term_plane, term_cursor_y + 1, term_cursor_x + 1, "█");
+}
+
+/* Draw help bar */
+static void draw_help(void) {
+    ncplane_erase(help_plane);
+
+    struct { const char *key; const char *desc; } help[] = {
+        {"F5", "Run"},
+        {"F6", "Step"},
+        {"F7", "Pause"},
+        {"F8", "Reset"},
+        {"PgUp/Dn", "Mem"},
+        {"Home", "MemPC"},
+        {"F12", "Quit"},
+        {NULL, NULL}
+    };
+
+    int x = 1;
+    for (int i = 0; help[i].key; i++) {
+        ncplane_set_fg_rgb(help_plane, COL_HELP_KEY);
+        ncplane_putstr_yx(help_plane, 0, x, help[i].key);
+        x += strlen(help[i].key);
+
+        ncplane_set_fg_rgb(help_plane, COL_HELP_DESC);
+        ncplane_printf_yx(help_plane, 0, x, ":%s ", help[i].desc);
+        x += strlen(help[i].desc) + 2;
+    }
+}
+
+/* Draw status bar */
+static void draw_status(void) {
+    ncplane_erase(status_plane);
+
+    /* Status indicator */
+    const char *status;
+    uint32_t color;
+    if (cpu.halted) {
+        status = "HALTED";
+        color = COL_STATUS_HALT;
+    } else if (paused) {
+        status = "PAUSED";
+        color = COL_STATUS_PAUSE;
+    } else {
+        status = "RUNNING";
+        color = COL_STATUS_RUN;
+    }
+
+    ncplane_set_fg_rgb(status_plane, color);
+    ncplane_printf_yx(status_plane, 0, 1, "● %s", status);
+
+    /* Cycle count */
+    ncplane_set_fg_rgb(status_plane, COL_LABEL);
+    ncplane_printf_yx(status_plane, 0, 15, "Cycles: ");
+    ncplane_set_fg_rgb(status_plane, COL_VALUE);
+    ncplane_printf_yx(status_plane, 0, 23, "%lu", total_cycles);
+
+    /* Memory view address */
+    ncplane_set_fg_rgb(status_plane, COL_LABEL);
+    ncplane_printf_yx(status_plane, 0, 40, "Mem: ");
+    ncplane_set_fg_rgb(status_plane, COL_VALUE);
+    ncplane_printf_yx(status_plane, 0, 45, "$%04X", mem_view_addr);
+}
+
+/* Create planes for the TUI */
+static int create_planes(void) {
+    unsigned term_rows, term_cols;
+    ncplane_dim_yx(stdp, &term_rows, &term_cols);
+
+    /* Layout:
+     * +--------------------+---------------------------+
+     * | Registers (20x8)   | Disassembly (45xN)        |
+     * +--------------------+---------------------------+
+     * | Memory (76x10)                                 |
+     * +------------------------------------------------+
+     * | Terminal (82x26)                               |
+     * +------------------------------------------------+
+     * | Help bar                                       |
+     * | Status bar                                     |
+     * +------------------------------------------------+
+     */
+
+    struct ncplane_options opts = {0};
+
+    /* Registers: top-left */
+    opts.y = 0;
+    opts.x = 0;
+    opts.rows = 8;
+    opts.cols = 20;
+    reg_plane = ncplane_create(stdp, &opts);
+    if (!reg_plane) return -1;
+
+    /* Disassembly: top-right of registers */
+    opts.y = 0;
+    opts.x = 20;
+    opts.rows = 8;
+    opts.cols = term_cols - 20;
+    dis_plane = ncplane_create(stdp, &opts);
+    if (!dis_plane) return -1;
+
+    /* Memory: below registers/disassembly */
+    opts.y = 8;
+    opts.x = 0;
+    opts.rows = 10;
+    opts.cols = term_cols;
+    mem_plane = ncplane_create(stdp, &opts);
+    if (!mem_plane) return -1;
+
+    /* Terminal: main area - full width */
+    opts.y = 18;
+    opts.x = 0;
+    opts.rows = TERM_ROWS + 2;
+    opts.cols = term_cols;
+    term_plane = ncplane_create(stdp, &opts);
+    if (!term_plane) return -1;
+
+    /* Help bar */
+    opts.y = term_rows - 2;
+    opts.x = 0;
+    opts.rows = 1;
+    opts.cols = term_cols;
+    help_plane = ncplane_create(stdp, &opts);
+    if (!help_plane) return -1;
+
+    /* Status bar */
+    opts.y = term_rows - 1;
+    opts.x = 0;
+    opts.rows = 1;
+    opts.cols = term_cols;
+    status_plane = ncplane_create(stdp, &opts);
+    if (!status_plane) return -1;
+
+    return 0;
+}
+
+/* Render all panels */
+static void render_all(void) {
+    draw_registers();
+    draw_disassembly();
+    draw_memory();
+    draw_terminal();
+    draw_help();
+    draw_status();
+    notcurses_render(nc);
+}
+
+/* Save previous register values */
+static void save_prev_regs(void) {
+    prev_pc = cpu.pc;
+    prev_sp = cpu.sp;
+    prev_ix = cpu.ix;
+    prev_iy = cpu.iy;
+    prev_a = cpu.a;
+    prev_b = cpu.b;
+    prev_c = cpu.c;
+    prev_d = cpu.d;
+    prev_e = cpu.e;
+    prev_h = cpu.h;
+    prev_l = cpu.l;
+    prev_flags = get_flags();
+}
+
+/* Main function */
+int main(int argc, char *argv[]) {
+    const char *rom_file = NULL;
+
+    /* Parse arguments */
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            rom_file = argv[i];
+        }
+    }
+
+    if (!rom_file) {
+        fprintf(stderr, "Usage: %s <rom.bin>\n", argv[0]);
+        return 1;
+    }
+
+    /* Initialize memory and load ROM */
+    memset(memory, 0, sizeof(memory));
+    if (load_rom(rom_file) < 0) {
+        fprintf(stderr, "Failed to load ROM: %s\n", rom_file);
+        return 1;
+    }
+
+    /* Initialize CPU */
+    z80_init(&cpu);
+    cpu.read_byte = mem_read;
+    cpu.write_byte = mem_write;
+    cpu.port_in = port_in;
+    cpu.port_out = port_out;
+
+    /* Clear terminal */
+    term_clear();
+
+    /* Initialize notcurses */
+    setlocale(LC_ALL, "");
+
+    struct notcurses_options ncopts = {
+        .flags = NCOPTION_SUPPRESS_BANNERS,
+    };
+
+    nc = notcurses_init(&ncopts, NULL);
+    if (!nc) {
+        fprintf(stderr, "Failed to initialize notcurses\n");
+        return 1;
+    }
+
+    stdp = notcurses_stdplane(nc);
+
+    /* Clear the standard plane to remove any garbage from terminal queries */
+    ncplane_erase(stdp);
+    notcurses_render(nc);
+
+    /* Drain any pending input (terminal query responses) - with timeout */
+    {
+        struct timespec drain_ts = {0, 0}; /* Non-blocking */
+        ncinput drain_ni;
+        int drain_count = 0;
+        /* Drain up to 1000 events or until none left */
+        while (drain_count < 1000 && notcurses_get(nc, &drain_ts, &drain_ni) != 0) {
+            drain_count++;
+        }
+    }
+
+    /* Clear the emulated system's input buffer */
+    input_head = 0;
+    input_tail = 0;
+
+    if (create_planes() < 0) {
+        notcurses_stop(nc);
+        fprintf(stderr, "Failed to create planes\n");
+        return 1;
+    }
+
+    running = true;
+    save_prev_regs();
+    render_all();
+
+    /* Main loop */
+    struct timespec ts = {0, 10000000}; /* 10ms timeout for input */
+
+    while (running) {
+        ncinput ni;
+        uint32_t id = notcurses_get(nc, &ts, &ni);
+
+        if (id == (uint32_t)-1) {
+            break; /* Error */
+        }
+
+        if (id == NCKEY_RESIZE) {
+            /* Handle terminal resize */
+            notcurses_refresh(nc, NULL, NULL);
+            /* Recreate planes - for now just re-render */
+            render_all();
+            continue;
+        }
+
+        if (id != 0) {
+            bool need_render = true;
+
+            switch (id) {
+                case NCKEY_F12:
+                    running = false;
+                    break;
+
+                case NCKEY_F05:  /* Run */
+                    paused = false;
+                    break;
+
+                case NCKEY_F06:  /* Step */
+                    if (!cpu.halted) {
+                        save_prev_regs();
+                        z80_step(&cpu);
+                        total_cycles = cpu.cyc;
+                    }
+                    break;
+
+                case NCKEY_F07:  /* Pause */
+                    paused = true;
+                    break;
+
+                case NCKEY_F08:  /* Reset */
+                    z80_init(&cpu);
+                    cpu.read_byte = mem_read;
+                    cpu.write_byte = mem_write;
+                    cpu.port_in = port_in;
+                    cpu.port_out = port_out;
+                    total_cycles = 0;
+                    term_clear();
+                    paused = true;
+                    save_prev_regs();
+                    break;
+
+                case NCKEY_PGUP:
+                    if (mem_view_addr >= 0x80) {
+                        mem_view_addr -= 0x80;
+                    } else {
+                        mem_view_addr = 0;
+                    }
+                    break;
+
+                case NCKEY_PGDOWN:
+                    if (mem_view_addr + 0x80 < MEM_SIZE) {
+                        mem_view_addr += 0x80;
+                    }
+                    break;
+
+                case NCKEY_HOME:  /* Memory view to PC */
+                    mem_view_addr = cpu.pc & 0xFFF0;
+                    break;
+
+                default:
+                    /* Send printable characters to the emulated system */
+                    if (id >= 32 && id < 127) {
+                        input_putchar((char)id);
+                    } else if (id == NCKEY_ENTER || id == '\r' || id == '\n') {
+                        input_putchar('\r');
+                    } else if (id == NCKEY_BACKSPACE || id == 127) {
+                        input_putchar('\b');
+                    }
+                    need_render = false;
+                    break;
+            }
+
+            if (need_render) {
+                render_all();
+            }
+        }
+
+        /* Run CPU if not paused */
+        if (!paused && !cpu.halted) {
+            save_prev_regs();
+            for (int i = 0; i < cycles_per_frame && !cpu.halted; i++) {
+                z80_step(&cpu);
+            }
+            total_cycles = cpu.cyc;
+            render_all();
+        }
+    }
+
+    /* Cleanup */
+    notcurses_stop(nc);
+
+    /* Drain any remaining terminal responses */
+    usleep(100000); /* 100ms for terminal to finish responding */
+
+    /* Consume any garbage left in stdin */
+    {
+        struct termios oldt, newt;
+        tcgetattr(STDIN_FILENO, &oldt);
+        newt = oldt;
+        newt.c_lflag &= ~(ICANON | ECHO);
+        newt.c_cc[VMIN] = 0;
+        newt.c_cc[VTIME] = 1; /* 100ms timeout */
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+        while (read(STDIN_FILENO, &(char){0}, 1) > 0) {
+            /* drain */
+        }
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    }
+
+    return 0;
+}
