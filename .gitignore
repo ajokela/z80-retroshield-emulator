@@ -4,7 +4,6 @@
 
 # Executables
 retroshield
-retroshield_tui
 retroshield_nc
 
 # Libraries
@@ -27,3 +26,9 @@ retroshield_nc
 
 # Build directories
 build/
+
+# Attic (helper scripts, test files, ROM copies)
+attic/
+
+# Claude Code instructions
+CLAUDE.md

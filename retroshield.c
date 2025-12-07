@@ -1,7 +1,7 @@
 /*
  * RetroShield Z80 Emulator
  * Uses superzazu/z80 library for Z80 emulation
- * Emulates MC6850 ACIA at ports $80/$81
+ * Emulates MC6850 ACIA at ports $80/$81 and Intel 8251 at ports $00/$01
  *
  * Copyright (c) 2025 Alex Jokela
  * SPDX-License-Identifier: MIT
@@ -19,26 +19,39 @@
 
 #include "z80.h"
 
-#define ROM_SIZE 0x2000   /* 8KB ROM */
-#define RAM_START 0x2000
-#define RAM_SIZE 0x6000   /* 24KB RAM */
-#define MEM_SIZE 0x8000   /* 32KB total */
+#define MEM_SIZE 0x10000  /* Full 64KB address space */
 
-/* MC6850 ACIA ports */
+/* ROM size - configurable per ROM type */
+static uint16_t rom_size = 0x2000;  /* Default 8KB ROM */
+
+/* MC6850 ACIA ports (Pascal firmware, etc.) */
 #define ACIA_CTRL 0x80
 #define ACIA_DATA 0x81
-
-/* ACIA status bits */
 #define ACIA_RDRF 0x01  /* Receive Data Register Full */
 #define ACIA_TDRE 0x02  /* Transmit Data Register Empty */
+#define ACIA_IRQ_EN 0x80  /* Bit 7: Receive Interrupt Enable */
+
+static uint8_t acia_control = 0;  /* Track ACIA control register */
+static bool uses_8251 = false;     /* Track if ROM uses 8251 (for interrupt support) */
+
+/* Intel 8251 USART ports (Grant's BASIC, EFEX, etc.) */
+#define USART_DATA 0x00
+#define USART_CTRL 0x01
+#define STAT_8251_TxRDY 0x01
+#define STAT_8251_RxRDY 0x02
+#define STAT_8251_TxE   0x04
+#define STAT_DSR        0x80
+#define USART_STATUS_INIT (STAT_8251_TxRDY | STAT_8251_TxE | STAT_DSR)
 
 static uint8_t memory[MEM_SIZE];
 static z80 cpu;
 static bool debug_mode = false;
 static int max_cycles = 0;
+static bool stdin_eof = false;  /* Track if we've hit EOF on stdin */
 
 /* Check if input available on stdin (non-blocking) */
 static int kbhit(void) {
+    if (stdin_eof) return 0;  /* No more input after EOF */
     struct timeval tv = {0, 0};
     fd_set fds;
     FD_ZERO(&fds);
@@ -49,16 +62,14 @@ static int kbhit(void) {
 /* Memory read callback */
 static uint8_t mem_read(void *userdata, uint16_t addr) {
     (void)userdata;
-    if (addr < MEM_SIZE) {
-        return memory[addr];
-    }
-    return 0xFF;
+    return memory[addr];
 }
 
 /* Memory write callback */
 static void mem_write(void *userdata, uint16_t addr, uint8_t val) {
     (void)userdata;
-    if (addr >= RAM_START && addr < MEM_SIZE) {
+    /* Protect ROM area */
+    if (addr >= rom_size) {
         memory[addr] = val;
     }
 }
@@ -67,8 +78,8 @@ static void mem_write(void *userdata, uint16_t addr, uint8_t val) {
 static uint8_t port_in(z80 *z, uint8_t port) {
     (void)z;
 
+    /* MC6850 ACIA (ports $80/$81) */
     if (port == ACIA_CTRL) {
-        /* Status register */
         uint8_t status = ACIA_TDRE;  /* Always ready to transmit */
         if (kbhit()) {
             status |= ACIA_RDRF;  /* Data available */
@@ -76,12 +87,36 @@ static uint8_t port_in(z80 *z, uint8_t port) {
         return status;
     }
     else if (port == ACIA_DATA) {
-        /* Data register - read from stdin */
         if (kbhit()) {
             int c = getchar();
             if (c == EOF) {
+                stdin_eof = true;
                 return 0;
             }
+            return (uint8_t)c;
+        }
+        return 0;
+    }
+
+    /* Intel 8251 USART (ports $00/$01) */
+    else if (port == USART_CTRL) {
+        uses_8251 = true;  /* ROM uses 8251, enable interrupt support */
+        uint8_t status = USART_STATUS_INIT;  /* TxRDY + TxE + DSR */
+        if (kbhit()) {
+            status |= STAT_8251_RxRDY;  /* Data available */
+        }
+        return status;
+    }
+    else if (port == USART_DATA) {
+        uses_8251 = true;  /* ROM uses 8251, enable interrupt support */
+        if (kbhit()) {
+            int c = getchar();
+            if (c == EOF) {
+                stdin_eof = true;
+                return 0;
+            }
+            /* Convert lowercase to uppercase like Arduino does */
+            if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
             return (uint8_t)c;
         }
         return 0;
@@ -94,12 +129,38 @@ static uint8_t port_in(z80 *z, uint8_t port) {
 static void port_out(z80 *z, uint8_t port, uint8_t val) {
     (void)z;
 
-    if (port == ACIA_DATA) {
-        /* Write to stdout */
+    /* MC6850 ACIA control (port $80) */
+    if (port == ACIA_CTRL) {
+        acia_control = val;
+    }
+    /* MC6850 ACIA data (port $81) */
+    else if (port == ACIA_DATA) {
         putchar(val);
         fflush(stdout);
     }
-    /* Control register writes ignored for now */
+    /* Intel 8251 USART data (port $00) */
+    else if (port == USART_DATA) {
+        putchar(val);
+        fflush(stdout);
+    }
+    /* Control/mode register writes ignored */
+}
+
+/* Configure ROM size based on ROM type */
+static void configure_rom(const char *filename) {
+    const char *basename = strrchr(filename, '/');
+    if (basename) basename++; else basename = filename;
+
+    /* MINT: small ROM (~2KB), rest is RAM */
+    if (strstr(basename, "mint") != NULL) {
+        rom_size = 0x0800;  /* 2KB ROM */
+        if (debug_mode) fprintf(stderr, "MINT ROM: %d bytes protected\n", rom_size);
+    }
+    /* Default: 8KB ROM */
+    else {
+        rom_size = 0x2000;
+        if (debug_mode) fprintf(stderr, "Default ROM: %d bytes protected\n", rom_size);
+    }
 }
 
 /* Load binary ROM file */
@@ -110,7 +171,8 @@ static int load_rom(const char *filename) {
         return -1;
     }
 
-    size_t bytes = fread(memory, 1, ROM_SIZE, f);
+    /* Read up to full 64KB - some ROMs include RAM initialization */
+    size_t bytes = fread(memory, 1, MEM_SIZE, f);
     fclose(f);
 
     if (bytes == 0) {
@@ -174,6 +236,9 @@ int main(int argc, char *argv[]) {
     /* Initialize memory */
     memset(memory, 0, sizeof(memory));
 
+    /* Configure ROM size based on ROM type */
+    configure_rom(rom_file);
+
     /* Load ROM */
     if (load_rom(rom_file) < 0) {
         return 1;
@@ -195,11 +260,27 @@ int main(int argc, char *argv[]) {
 
     /* Main emulation loop */
     unsigned long total_cycles = 0;
+    bool int_pending = false;
+
     while (1) {
         z80_step(&cpu);
         total_cycles = cpu.cyc;
 
+        /* Trigger interrupt when input is available (for 8251-based ROMs only) */
+        if (uses_8251 && kbhit() && cpu.iff1 && !int_pending && cpu.iff_delay == 0) {
+            z80_gen_int(&cpu, 0xFF);  /* RST 38H vector for IM 1 */
+            int_pending = true;
+        }
+
+        /* Clear pending flag when interrupts are disabled (char was read) */
+        if (!cpu.iff1) {
+            int_pending = false;
+        }
+
         if (max_cycles > 0 && total_cycles >= (unsigned long)max_cycles) {
+            if (debug_mode) {
+                fprintf(stderr, "Stopped at PC=%04X after %lu cycles\n", cpu.pc, total_cycles);
+            }
             break;
         }
 

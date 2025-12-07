@@ -22,11 +22,17 @@
 #include "z80.h"
 #include "z80_disasm.h"
 
-/* Memory configuration - matches Arduino kz80_grantz80 */
-#define ROM_SIZE 0x2000       /* 8KB ROM at $0000-$1FFF */
-#define RAM_START 0x2000      /* RAM starts at $2000 */
-#define RAM_END 0x37FF        /* RAM ends at $37FF (6KB, matches Arduino) */
+/* Memory configuration */
 #define MEM_SIZE 0x10000      /* Full 64KB address space */
+
+/* ROM size - configurable per ROM type */
+static uint16_t rom_size = 0x2000;  /* Default 8KB ROM */
+
+/* RAM configuration - can be changed via command line or per-ROM */
+/* Grant's BASIC: $2000-$37FF (6KB) */
+/* EFEX monitor:  $E800-$FFFF (6KB) */
+static uint16_t ram_start = 0x2000;
+static uint16_t ram_end = 0x37FF;
 
 /* MC6850 ACIA ports (used by our Pascal firmware) */
 #define ACIA_CTRL 0x80
@@ -66,6 +72,7 @@ static char input_buffer[INPUT_BUF_SIZE];
 static int input_head = 0;
 static int input_tail = 0;
 static bool int_signaled = false;  /* Track if interrupt was signaled for current input */
+static bool uses_8251 = false;     /* Track if ROM uses 8251 (for interrupt support) */
 
 /* Emulator state */
 static bool running = false;
@@ -123,22 +130,13 @@ static char input_getchar(void);
 /* Memory callbacks */
 static uint8_t mem_read(void *userdata, uint16_t addr) {
     (void)userdata;
-    /* ROM: $0000-$1FFF */
-    if (addr < ROM_SIZE) {
-        return memory[addr];
-    }
-    /* RAM: $2000-$7FFF (or configured RAM_END) */
-    if (addr >= RAM_START && addr <= RAM_END) {
-        return memory[addr];
-    }
-    /* Unmapped: return $FF */
-    return 0xFF;
+    return memory[addr];
 }
 
 static void mem_write(void *userdata, uint16_t addr, uint8_t val) {
     (void)userdata;
-    /* Only RAM is writable */
-    if (addr >= RAM_START && addr <= RAM_END) {
+    /* Protect ROM area */
+    if (addr >= rom_size) {
         memory[addr] = val;
     }
 }
@@ -155,11 +153,13 @@ static uint8_t port_in(z80 *z, uint8_t port) {
     }
     /* Intel 8251 USART (ports $00/$01) - Grant's BASIC */
     else if (port == USART_CTRL) {
+        uses_8251 = true;  /* ROM uses 8251, enable interrupt support */
         /* Match Arduino: status = 0x85 (TxRDY + TxE + DSR), add RxRDY when input available */
         uint8_t status = USART_STATUS_INIT;
         if (input_available()) status |= STAT_8251_RxRDY;
         return status;
     } else if (port == USART_DATA) {
+        uses_8251 = true;  /* ROM uses 8251, enable interrupt support */
         /* Reading data clears RxRDY and deasserts interrupt */
         if (input_available()) {
             char c = input_getchar();
@@ -178,9 +178,15 @@ static void port_out(z80 *z, uint8_t port, uint8_t val) {
     if (port == ACIA_DATA) {
         term_putchar(val);
     }
-    /* Intel 8251 USART (port $00) - Grant's BASIC */
+    /* Intel 8251 USART (port $00) - data */
     else if (port == USART_DATA) {
         term_putchar(val);
+    }
+    /* Intel 8251 USART (port $01) - mode/command register */
+    else if (port == USART_CTRL) {
+        /* We mostly ignore this, but could track state if needed */
+        /* Commands like $37 enable TX/RX and clear errors */
+        /* Mode bytes like $4D set 8-N-1 format */
     }
 }
 
@@ -246,11 +252,26 @@ static void input_putchar(char c) {
     }
 }
 
-/* ROM loading */
+/* Configure ROM size based on ROM type */
+static void configure_rom(const char *filename) {
+    const char *basename = strrchr(filename, '/');
+    if (basename) basename++; else basename = filename;
+
+    /* MINT: small ROM (~2KB), rest is RAM */
+    if (strstr(basename, "mint") != NULL) {
+        rom_size = 0x0800;  /* 2KB ROM */
+    }
+    /* Default: 8KB ROM */
+    else {
+        rom_size = 0x2000;
+    }
+}
+
+/* ROM loading - reads up to 64KB for ROMs that include RAM init */
 static int load_rom(const char *filename) {
     FILE *f = fopen(filename, "rb");
     if (!f) return -1;
-    size_t bytes = fread(memory, 1, ROM_SIZE, f);
+    size_t bytes = fread(memory, 1, MEM_SIZE, f);
     fclose(f);
     return (bytes > 0) ? 0 : -1;
 }
@@ -531,11 +552,12 @@ static size_t get_memory_usage_kb(void) {
 /* Calculate emulated RAM usage */
 static int get_emu_ram_usage(void) {
     int used = 0;
+    int ram_size = (int)ram_end - (int)ram_start + 1;
     /* Count non-zero bytes in RAM area */
-    for (int i = RAM_START; i <= RAM_END; i++) {
-        if (memory[i] != 0) used++;
+    for (int i = 0; i < ram_size; i++) {
+        if (memory[ram_start + i] != 0) used++;
     }
-    return (used * 100) / (RAM_END - RAM_START + 1);
+    return (used * 100) / ram_size;
 }
 
 /* Draw metrics panel */
@@ -590,7 +612,7 @@ static void draw_metrics(void) {
     ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
     ncplane_putstr_yx(metrics_plane, y, 2, "ROM:");
     ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
-    ncplane_printf_yx(metrics_plane, y++, 7, "%d KB", ROM_SIZE / 1024);
+    ncplane_printf_yx(metrics_plane, y++, 7, "%d KB", rom_size / 1024);
 
     y++;
 
@@ -675,25 +697,28 @@ static int create_planes(void) {
     unsigned term_rows, term_cols;
     ncplane_dim_yx(stdp, &term_rows, &term_cols);
 
-    /* Layout:
-     * +--------------------+---------------------------+---------------+
-     * | Registers (20x8)   | Disassembly (45x8)        | Metrics       |
-     * +--------------------+---------------------------+ (22x18)       |
-     * | Memory (term_cols - 22 x 10)                   |               |
-     * +------------------------------------------------+---------------+
-     * | Terminal (full width x 26)                                     |
-     * +----------------------------------------------------------------+
-     * | Help bar                                                       |
-     * | Status bar                                                     |
-     * +----------------------------------------------------------------+
+    /* Adaptive layout based on terminal size
+     * Minimum: 80x24
+     *
+     * For small terminals (< 46 rows): simplified layout
+     * For large terminals: full debugger layout
      */
 
     struct ncplane_options opts = {0};
 
     int metrics_width = 22;
-    int left_width = term_cols - metrics_width;
+    int left_width = (int)term_cols - metrics_width;
+    if (left_width < 60) left_width = 60;
+
     int dis_width = left_width - 20;
-    if (dis_width < 30) dis_width = 30; /* Minimum disassembly width */
+    if (dis_width < 30) dis_width = 30;
+
+    /* Calculate available space for terminal */
+    int top_section_height = 18;  /* registers + memory */
+    int bottom_bars = 2;          /* help + status */
+    int term_height = (int)term_rows - top_section_height - bottom_bars;
+    if (term_height < 6) term_height = 6;
+    if (term_height > TERM_ROWS + 2) term_height = TERM_ROWS + 2;
 
     /* Registers: top-left */
     opts.y = 0;
@@ -711,7 +736,7 @@ static int create_planes(void) {
     dis_plane = ncplane_create(stdp, &opts);
     if (!dis_plane) return -1;
 
-    /* Metrics: right side, spans both rows (8 + 10 = 18) */
+    /* Metrics: right side */
     opts.y = 0;
     opts.x = left_width;
     opts.rows = 18;
@@ -719,7 +744,7 @@ static int create_planes(void) {
     metrics_plane = ncplane_create(stdp, &opts);
     if (!metrics_plane) return -1;
 
-    /* Memory: below registers/disassembly, left of metrics */
+    /* Memory: below registers/disassembly */
     opts.y = 8;
     opts.x = 0;
     opts.rows = 10;
@@ -727,10 +752,10 @@ static int create_planes(void) {
     mem_plane = ncplane_create(stdp, &opts);
     if (!mem_plane) return -1;
 
-    /* Terminal: main area - full width */
-    opts.y = 18;
+    /* Terminal: below debug panels */
+    opts.y = top_section_height;
     opts.x = 0;
-    opts.rows = TERM_ROWS + 2;
+    opts.rows = term_height;
     opts.cols = term_cols;
     term_plane = ncplane_create(stdp, &opts);
     if (!term_plane) return -1;
@@ -782,6 +807,28 @@ static void save_prev_regs(void) {
     prev_flags = get_flags();
 }
 
+/* Configure RAM based on ROM type (for metrics display) */
+static void configure_ram_for_rom(const char *rom_file) {
+    /* Extract base filename from path */
+    const char *basename = strrchr(rom_file, '/');
+    if (basename) {
+        basename++;
+    } else {
+        basename = rom_file;
+    }
+
+    /* EFEX monitor: RAM at $E800-$FFFF */
+    if (strstr(basename, "efex") != NULL) {
+        ram_start = 0xE800;
+        ram_end = 0xFFFF;
+    }
+    /* Grant's BASIC / default: RAM at $2000-$37FF */
+    else {
+        ram_start = 0x2000;
+        ram_end = 0x37FF;
+    }
+}
+
 /* Main function */
 int main(int argc, char *argv[]) {
     const char *rom_file = NULL;
@@ -798,11 +845,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Configure ROM and RAM based on ROM type before loading */
+    configure_rom(rom_file);
+    configure_ram_for_rom(rom_file);
+
     /* Initialize memory and load ROM */
-    /* ROM area will be overwritten by load_rom, RAM area left at 0 */
     memset(memory, 0, sizeof(memory));
-    /* Some ROMs need high memory to return $FF to detect RAM top */
-    /* For now, we have full 64KB RAM */
     if (load_rom(rom_file) < 0) {
         fprintf(stderr, "Failed to load ROM: %s\n", rom_file);
         return 1;
@@ -838,21 +886,6 @@ int main(int argc, char *argv[]) {
     }
 
     stdp = notcurses_stdplane(nc);
-
-    /* Clear the standard plane to remove any garbage from terminal queries */
-    ncplane_erase(stdp);
-    notcurses_render(nc);
-
-    /* Drain any pending input (terminal query responses) - with timeout */
-    {
-        struct timespec drain_ts = {0, 0}; /* Non-blocking */
-        ncinput drain_ni;
-        int drain_count = 0;
-        /* Drain up to 1000 events or until none left */
-        while (drain_count < 1000 && notcurses_get(nc, &drain_ts, &drain_ni) != 0) {
-            drain_count++;
-        }
-    }
 
     /* Clear the emulated system's input buffer */
     input_head = 0;
@@ -974,9 +1007,9 @@ int main(int argc, char *argv[]) {
             save_prev_regs();
             for (int i = 0; i < cycles_per_frame && !cpu.halted; i++) {
                 z80_step(&cpu);
-                /* Trigger interrupt if input available (for 8251 USART ROMs) */
+                /* Trigger interrupt if input available (for 8251 USART ROMs only) */
                 /* Check after step so iff_delay has been processed */
-                if (input_available() && cpu.iff1 && !int_signaled && cpu.iff_delay == 0) {
+                if (uses_8251 && input_available() && cpu.iff1 && !int_signaled && cpu.iff_delay == 0) {
                     z80_gen_int(&cpu, 0xFF);  /* RST 38H in IM1 mode */
                     int_signaled = true;
                 }

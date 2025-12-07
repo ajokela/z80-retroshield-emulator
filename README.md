@@ -1,31 +1,36 @@
 # RetroShield Z80 Emulator
 
-A Z80 emulator for testing RetroShield Z80 firmware on your development machine. Includes both a simple passthrough emulator and a full-featured TUI debugger.
+A Z80 emulator for testing [RetroShield Z80](https://www.interlockelectronics.com/retroshield-z80/) firmware on your development machine. Includes both a simple passthrough emulator and a full-featured TUI debugger.
+
+This emulator is designed to run the firmware from the [retroshield-arduino](https://gitlab.com/ajokela/retroshield-arduino) repository.
+
+![RetroShield Z80 Emulator TUI](retroshield_z80_emulator.png)
 
 ## Features
 
 - **Cycle-accurate Z80 emulation** using the [superzazu/z80](https://github.com/superzazu/z80) library
-- **MC6850 ACIA emulation** for serial I/O (matches RetroShield hardware)
+- **Dual serial chip emulation:**
+  - MC6850 ACIA (ports $80/$81) - used by MINT, Firth, Monty, Retro Pascal
+  - Intel 8251 USART (ports $00/$01) - used by Grant's BASIC, EFEX
 - **Two emulator modes:**
   - `retroshield` - Simple passthrough (stdin/stdout)
-  - `retroshield_tui` - Full TUI debugger with registers, disassembly, memory view
+  - `retroshield_nc` - Full TUI debugger with registers, disassembly, memory view (using notcurses)
 
 ## Building
 
 ### Prerequisites
 
 - C99 compiler (gcc, clang)
-- ncurses library (for TUI version)
+- notcurses library (for TUI version)
 
 On macOS:
 ```bash
-# ncurses is included with Xcode command line tools
-xcode-select --install
+brew install notcurses
 ```
 
 On Debian/Ubuntu:
 ```bash
-sudo apt-get install libncurses-dev
+sudo apt-get install libnotcurses-dev
 ```
 
 ### Compile
@@ -33,7 +38,7 @@ sudo apt-get install libncurses-dev
 ```bash
 make              # Build both emulators
 make retroshield  # Build passthrough only
-make retroshield_tui  # Build TUI only
+make retroshield_nc  # Build TUI only
 ```
 
 ## Usage
@@ -60,12 +65,7 @@ Example:
 Full-screen debugger with register display, disassembly, memory view, and terminal:
 
 ```bash
-./retroshield_tui <rom.bin>
-```
-
-Or use make:
-```bash
-make tui ROM=../firmware/pascal.z80.bin
+./retroshield_nc <rom.bin>
 ```
 
 ## TUI Controls
@@ -139,39 +139,41 @@ The emulator provides MC6850 ACIA emulation matching the RetroShield hardware:
 ```
 emulator/
 ├── retroshield.c      # Passthrough emulator
-├── retroshield_tui.c  # TUI debugger
+├── retroshield_nc.c   # TUI debugger (notcurses)
 ├── z80.c              # Z80 CPU emulation (superzazu/z80)
 ├── z80.h              # Z80 header
 ├── z80_disasm.c       # Z80 disassembler
 ├── z80_disasm.h       # Disassembler header
 ├── Makefile
-└── README.md
+├── README.md
+└── attic/             # Helper scripts, test files, ROM copies
 ```
 
 ## Examples
 
-### Testing Pascal Interpreter
+### Testing ROMs
 
 ```bash
-# Build the Pascal firmware first
-cd ..
-make
+# Run MINT
+./retroshield ../kz80_mint/firmware/mint.z80.bin
 
-# Run in passthrough mode
-cd emulator
-./retroshield ../firmware/pascal.z80.bin
+# Run Firth Forth
+./retroshield ../kz80_forth/firmware/firth.z80.bin
 
-# Or debug with TUI
-./retroshield_tui ../firmware/pascal.z80.bin
+# Run Grant's BASIC
+./retroshield ../kz80_grantz80/firmware/grantz80_basic.bin
+
+# Debug with TUI
+./retroshield_nc ../kz80_pascal/firmware/pascal.z80.bin
 ```
 
 ### Debugging a Crash
 
-1. Run `./retroshield_tui rom.bin`
+1. Run `./retroshield_nc rom.bin`
 2. Press **F5** to run until crash/halt
 3. Press **F7** to pause
 4. Examine registers and disassembly
-5. Use **F9/F10** to browse memory
+5. Use **PgUp/PgDn** to browse memory
 6. Press **F8** to reset and try again
 
 ### Scripted Testing
@@ -189,5 +191,7 @@ echo "3.14" | ./retroshield -c 1000000 ../firmware/pascal.z80.bin
 
 ## See Also
 
-- [RetroShield Z80](http://www.onetechshop.com/retroshield-z80/) - Hardware platform
+- [RetroShield Z80](https://www.interlockelectronics.com/retroshield-z80/) - Hardware platform by Interlock Electronics
+- [retroshield-hw](https://gitlab.com/8bitforce/retroshield-hw) - Original RetroShield hardware design by Erturk Kocalar
+- [retroshield-arduino](https://gitlab.com/ajokela/retroshield-arduino) - Canonical Arduino sketches for RetroShield
 - [superzazu/z80](https://github.com/superzazu/z80) - Z80 emulation library
