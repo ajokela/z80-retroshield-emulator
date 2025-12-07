@@ -15,22 +15,34 @@
 #include <time.h>
 #include <unistd.h>
 #include <termios.h>
+#include <sys/resource.h>
+#include <mach/mach.h>
 
 #include <notcurses/notcurses.h>
 #include "z80.h"
 #include "z80_disasm.h"
 
-/* Memory configuration */
-#define ROM_SIZE 0x2000
-#define RAM_START 0x2000
-#define RAM_SIZE 0x6000
-#define MEM_SIZE 0x8000
+/* Memory configuration - matches Arduino kz80_grantz80 */
+#define ROM_SIZE 0x2000       /* 8KB ROM at $0000-$1FFF */
+#define RAM_START 0x2000      /* RAM starts at $2000 */
+#define RAM_END 0x37FF        /* RAM ends at $37FF (6KB, matches Arduino) */
+#define MEM_SIZE 0x10000      /* Full 64KB address space */
 
-/* MC6850 ACIA ports */
+/* MC6850 ACIA ports (used by our Pascal firmware) */
 #define ACIA_CTRL 0x80
 #define ACIA_DATA 0x81
 #define ACIA_RDRF 0x01
 #define ACIA_TDRE 0x02
+
+/* Intel 8251 USART ports (used by Grant's BASIC) - matches Arduino exactly */
+#define USART_DATA 0x00
+#define USART_CTRL 0x01
+#define STAT_8251_TxRDY 0x01
+#define STAT_8251_RxRDY 0x02
+#define STAT_8251_TxE   0x04
+#define STAT_DSR        0x80
+/* Initial status: TxRDY + TxE + DSR = 0x85 */
+#define USART_STATUS_INIT (STAT_8251_TxRDY | STAT_8251_TxE | STAT_DSR)
 
 /* Terminal buffer */
 #define TERM_COLS 80
@@ -53,6 +65,7 @@ static int term_cursor_y = 0;
 static char input_buffer[INPUT_BUF_SIZE];
 static int input_head = 0;
 static int input_tail = 0;
+static bool int_signaled = false;  /* Track if interrupt was signaled for current input */
 
 /* Emulator state */
 static bool running = false;
@@ -66,10 +79,17 @@ static struct notcurses *nc = NULL;
 static struct ncplane *stdp = NULL;
 static struct ncplane *reg_plane = NULL;
 static struct ncplane *dis_plane = NULL;
+static struct ncplane *metrics_plane = NULL;
 static struct ncplane *mem_plane = NULL;
 static struct ncplane *term_plane = NULL;
 static struct ncplane *help_plane = NULL;
 static struct ncplane *status_plane = NULL;
+
+/* Metrics tracking */
+static struct timespec last_metrics_time;
+static unsigned long last_cycles = 0;
+static double cycles_per_sec = 0.0;
+static double cpu_percent = 0.0;
 
 /* Colors */
 #define COL_BORDER    0x4488cc
@@ -103,18 +123,29 @@ static char input_getchar(void);
 /* Memory callbacks */
 static uint8_t mem_read(void *userdata, uint16_t addr) {
     (void)userdata;
-    return (addr < MEM_SIZE) ? memory[addr] : 0xFF;
+    /* ROM: $0000-$1FFF */
+    if (addr < ROM_SIZE) {
+        return memory[addr];
+    }
+    /* RAM: $2000-$7FFF (or configured RAM_END) */
+    if (addr >= RAM_START && addr <= RAM_END) {
+        return memory[addr];
+    }
+    /* Unmapped: return $FF */
+    return 0xFF;
 }
 
 static void mem_write(void *userdata, uint16_t addr, uint8_t val) {
     (void)userdata;
-    if (addr >= RAM_START && addr < MEM_SIZE) {
+    /* Only RAM is writable */
+    if (addr >= RAM_START && addr <= RAM_END) {
         memory[addr] = val;
     }
 }
 
 static uint8_t port_in(z80 *z, uint8_t port) {
     (void)z;
+    /* MC6850 ACIA (ports $80/$81) */
     if (port == ACIA_CTRL) {
         uint8_t status = ACIA_TDRE;
         if (input_available()) status |= ACIA_RDRF;
@@ -122,12 +153,33 @@ static uint8_t port_in(z80 *z, uint8_t port) {
     } else if (port == ACIA_DATA) {
         return input_available() ? input_getchar() : 0;
     }
+    /* Intel 8251 USART (ports $00/$01) - Grant's BASIC */
+    else if (port == USART_CTRL) {
+        /* Match Arduino: status = 0x85 (TxRDY + TxE + DSR), add RxRDY when input available */
+        uint8_t status = USART_STATUS_INIT;
+        if (input_available()) status |= STAT_8251_RxRDY;
+        return status;
+    } else if (port == USART_DATA) {
+        /* Reading data clears RxRDY and deasserts interrupt */
+        if (input_available()) {
+            char c = input_getchar();
+            /* Arduino does toupper() on input */
+            if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+            return (uint8_t)c;
+        }
+        return 0;
+    }
     return 0xFF;
 }
 
 static void port_out(z80 *z, uint8_t port, uint8_t val) {
     (void)z;
+    /* MC6850 ACIA (port $81) */
     if (port == ACIA_DATA) {
+        term_putchar(val);
+    }
+    /* Intel 8251 USART (port $00) - Grant's BASIC */
+    else if (port == USART_DATA) {
         term_putchar(val);
     }
 }
@@ -181,6 +233,7 @@ static char input_getchar(void) {
     if (input_head == input_tail) return 0;
     char c = input_buffer[input_tail];
     input_tail = (input_tail + 1) % INPUT_BUF_SIZE;
+    int_signaled = false;  /* Allow new interrupt for next character */
     return c;
 }
 
@@ -189,6 +242,7 @@ static void input_putchar(char c) {
     if (next != input_tail) {
         input_buffer[input_head] = c;
         input_head = next;
+        int_signaled = false;  /* New input, allow interrupt */
     }
 }
 
@@ -429,6 +483,159 @@ static void draw_help(void) {
     }
 }
 
+/* Get host process metrics */
+static void update_metrics(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    double elapsed = (now.tv_sec - last_metrics_time.tv_sec) +
+                     (now.tv_nsec - last_metrics_time.tv_nsec) / 1e9;
+
+    if (elapsed >= 0.5) { /* Update every 500ms */
+        unsigned long cycle_diff = total_cycles - last_cycles;
+        cycles_per_sec = cycle_diff / elapsed;
+
+        /* Get CPU usage via rusage */
+        struct rusage usage;
+        if (getrusage(RUSAGE_SELF, &usage) == 0) {
+            static struct timeval last_utime = {0, 0};
+            static struct timeval last_stime = {0, 0};
+
+            double user = (usage.ru_utime.tv_sec - last_utime.tv_sec) +
+                         (usage.ru_utime.tv_usec - last_utime.tv_usec) / 1e6;
+            double sys = (usage.ru_stime.tv_sec - last_stime.tv_sec) +
+                        (usage.ru_stime.tv_usec - last_stime.tv_usec) / 1e6;
+
+            cpu_percent = ((user + sys) / elapsed) * 100.0;
+
+            last_utime = usage.ru_utime;
+            last_stime = usage.ru_stime;
+        }
+
+        last_metrics_time = now;
+        last_cycles = total_cycles;
+    }
+}
+
+/* Get memory usage in KB */
+static size_t get_memory_usage_kb(void) {
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) == KERN_SUCCESS) {
+        return info.resident_size / 1024;
+    }
+    return 0;
+}
+
+/* Calculate emulated RAM usage */
+static int get_emu_ram_usage(void) {
+    int used = 0;
+    /* Count non-zero bytes in RAM area */
+    for (int i = RAM_START; i <= RAM_END; i++) {
+        if (memory[i] != 0) used++;
+    }
+    return (used * 100) / (RAM_END - RAM_START + 1);
+}
+
+/* Draw metrics panel */
+static void draw_metrics(void) {
+    ncplane_erase(metrics_plane);
+    draw_box(metrics_plane, "Metrics");
+
+    update_metrics();
+
+    int y = 1;
+
+    /* Z80 Emulation metrics */
+    ncplane_set_fg_rgb(metrics_plane, COL_TITLE);
+    ncplane_putstr_yx(metrics_plane, y++, 2, "── Z80 ──");
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "Speed:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    if (cycles_per_sec >= 1e6) {
+        ncplane_printf_yx(metrics_plane, y++, 9, "%.2f MHz", cycles_per_sec / 1e6);
+    } else if (cycles_per_sec >= 1e3) {
+        ncplane_printf_yx(metrics_plane, y++, 9, "%.1f kHz", cycles_per_sec / 1e3);
+    } else {
+        ncplane_printf_yx(metrics_plane, y++, 9, "%.0f Hz", cycles_per_sec);
+    }
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "Cycles:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    if (total_cycles >= 1e9) {
+        ncplane_printf_yx(metrics_plane, y++, 10, "%.2fG", total_cycles / 1e9);
+    } else if (total_cycles >= 1e6) {
+        ncplane_printf_yx(metrics_plane, y++, 10, "%.2fM", total_cycles / 1e6);
+    } else if (total_cycles >= 1e3) {
+        ncplane_printf_yx(metrics_plane, y++, 10, "%.1fK", total_cycles / 1e3);
+    } else {
+        ncplane_printf_yx(metrics_plane, y++, 10, "%lu", total_cycles);
+    }
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "RAM:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    ncplane_printf_yx(metrics_plane, y++, 7, "%d%% used", get_emu_ram_usage());
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "Stack:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    int stack_depth = (0x3800 - cpu.sp) / 2; /* Assuming stack at top of RAM */
+    if (stack_depth < 0) stack_depth = 0;
+    ncplane_printf_yx(metrics_plane, y++, 9, "%d words", stack_depth);
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "ROM:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    ncplane_printf_yx(metrics_plane, y++, 7, "%d KB", ROM_SIZE / 1024);
+
+    y++;
+
+    /* I/O metrics */
+    ncplane_set_fg_rgb(metrics_plane, COL_TITLE);
+    ncplane_putstr_yx(metrics_plane, y++, 2, "── I/O ──");
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "InBuf:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    int pending = (input_head - input_tail + INPUT_BUF_SIZE) % INPUT_BUF_SIZE;
+    ncplane_printf_yx(metrics_plane, y++, 9, "%d chars", pending);
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "Term:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    ncplane_printf_yx(metrics_plane, y++, 8, "%dx%d", TERM_COLS, TERM_ROWS);
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "INT:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    ncplane_printf_yx(metrics_plane, y++, 7, "IM%d %s", cpu.interrupt_mode, cpu.iff1 ? "EI" : "DI");
+
+    y++;
+
+    /* Host metrics */
+    ncplane_set_fg_rgb(metrics_plane, COL_TITLE);
+    ncplane_putstr_yx(metrics_plane, y++, 2, "── Host ──");
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "CPU:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    ncplane_printf_yx(metrics_plane, y++, 7, "%.1f%%", cpu_percent);
+
+    ncplane_set_fg_rgb(metrics_plane, COL_LABEL);
+    ncplane_putstr_yx(metrics_plane, y, 2, "Mem:");
+    ncplane_set_fg_rgb(metrics_plane, COL_VALUE);
+    size_t mem_kb = get_memory_usage_kb();
+    if (mem_kb >= 1024) {
+        ncplane_printf_yx(metrics_plane, y++, 7, "%.1f MB", mem_kb / 1024.0);
+    } else {
+        ncplane_printf_yx(metrics_plane, y++, 7, "%zu KB", mem_kb);
+    }
+}
+
 /* Draw status bar */
 static void draw_status(void) {
     ncplane_erase(status_plane);
@@ -469,19 +676,24 @@ static int create_planes(void) {
     ncplane_dim_yx(stdp, &term_rows, &term_cols);
 
     /* Layout:
-     * +--------------------+---------------------------+
-     * | Registers (20x8)   | Disassembly (45xN)        |
-     * +--------------------+---------------------------+
-     * | Memory (76x10)                                 |
-     * +------------------------------------------------+
-     * | Terminal (82x26)                               |
-     * +------------------------------------------------+
-     * | Help bar                                       |
-     * | Status bar                                     |
-     * +------------------------------------------------+
+     * +--------------------+---------------------------+---------------+
+     * | Registers (20x8)   | Disassembly (45x8)        | Metrics       |
+     * +--------------------+---------------------------+ (22x18)       |
+     * | Memory (term_cols - 22 x 10)                   |               |
+     * +------------------------------------------------+---------------+
+     * | Terminal (full width x 26)                                     |
+     * +----------------------------------------------------------------+
+     * | Help bar                                                       |
+     * | Status bar                                                     |
+     * +----------------------------------------------------------------+
      */
 
     struct ncplane_options opts = {0};
+
+    int metrics_width = 22;
+    int left_width = term_cols - metrics_width;
+    int dis_width = left_width - 20;
+    if (dis_width < 30) dis_width = 30; /* Minimum disassembly width */
 
     /* Registers: top-left */
     opts.y = 0;
@@ -491,19 +703,27 @@ static int create_planes(void) {
     reg_plane = ncplane_create(stdp, &opts);
     if (!reg_plane) return -1;
 
-    /* Disassembly: top-right of registers */
+    /* Disassembly: middle top */
     opts.y = 0;
     opts.x = 20;
     opts.rows = 8;
-    opts.cols = term_cols - 20;
+    opts.cols = dis_width;
     dis_plane = ncplane_create(stdp, &opts);
     if (!dis_plane) return -1;
 
-    /* Memory: below registers/disassembly */
+    /* Metrics: right side, spans both rows (8 + 10 = 18) */
+    opts.y = 0;
+    opts.x = left_width;
+    opts.rows = 18;
+    opts.cols = metrics_width;
+    metrics_plane = ncplane_create(stdp, &opts);
+    if (!metrics_plane) return -1;
+
+    /* Memory: below registers/disassembly, left of metrics */
     opts.y = 8;
     opts.x = 0;
     opts.rows = 10;
-    opts.cols = term_cols;
+    opts.cols = left_width;
     mem_plane = ncplane_create(stdp, &opts);
     if (!mem_plane) return -1;
 
@@ -538,6 +758,7 @@ static int create_planes(void) {
 static void render_all(void) {
     draw_registers();
     draw_disassembly();
+    draw_metrics();
     draw_memory();
     draw_terminal();
     draw_help();
@@ -578,7 +799,10 @@ int main(int argc, char *argv[]) {
     }
 
     /* Initialize memory and load ROM */
+    /* ROM area will be overwritten by load_rom, RAM area left at 0 */
     memset(memory, 0, sizeof(memory));
+    /* Some ROMs need high memory to return $FF to detect RAM top */
+    /* For now, we have full 64KB RAM */
     if (load_rom(rom_file) < 0) {
         fprintf(stderr, "Failed to load ROM: %s\n", rom_file);
         return 1;
@@ -590,6 +814,12 @@ int main(int argc, char *argv[]) {
     cpu.write_byte = mem_write;
     cpu.port_in = port_in;
     cpu.port_out = port_out;
+
+    /* Grant's BASIC cold start has a loop at $0150-$015F that does DEC D
+     * and expects D to eventually become 1 so DEC D sets Z flag.
+     * Real Z80 has undefined register values at power-on.
+     * Initialize D=1 so the loop exits on first DEC D. */
+    cpu.d = 1;
 
     /* Clear terminal */
     term_clear();
@@ -636,6 +866,7 @@ int main(int argc, char *argv[]) {
 
     running = true;
     save_prev_regs();
+    clock_gettime(CLOCK_MONOTONIC, &last_metrics_time);
     render_all();
 
     /* Main loop */
@@ -658,6 +889,11 @@ int main(int argc, char *argv[]) {
         }
 
         if (id != 0) {
+            /* Only handle key press events, not releases */
+            if (ni.evtype == NCTYPE_RELEASE) {
+                continue;
+            }
+
             bool need_render = true;
 
             switch (id) {
@@ -711,6 +947,10 @@ int main(int argc, char *argv[]) {
                     mem_view_addr = cpu.pc & 0xFFF0;
                     break;
 
+                case NCKEY_END:  /* Memory view to $2000 (input buffer) */
+                    mem_view_addr = 0x2000;
+                    break;
+
                 default:
                     /* Send printable characters to the emulated system */
                     if (id >= 32 && id < 127) {
@@ -734,6 +974,12 @@ int main(int argc, char *argv[]) {
             save_prev_regs();
             for (int i = 0; i < cycles_per_frame && !cpu.halted; i++) {
                 z80_step(&cpu);
+                /* Trigger interrupt if input available (for 8251 USART ROMs) */
+                /* Check after step so iff_delay has been processed */
+                if (input_available() && cpu.iff1 && !int_signaled && cpu.iff_delay == 0) {
+                    z80_gen_int(&cpu, 0xFF);  /* RST 38H in IM1 mode */
+                    int_signaled = true;
+                }
             }
             total_cycles = cpu.cyc;
             render_all();
