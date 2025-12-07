@@ -1,6 +1,6 @@
 # RetroShield Z80 Emulator
 
-A Z80 emulator for testing [RetroShield Z80](https://www.interlockelectronics.com/retroshield-z80/) firmware on your development machine. Includes both a simple passthrough emulator and a full-featured TUI debugger.
+A Z80 emulator for testing [RetroShield Z80](https://8bitforce.com/about/) firmware on your development machine. Includes both a simple passthrough emulator and a full-featured TUI debugger.
 
 This emulator is designed to run the firmware from the [retroshield-arduino](https://gitlab.com/ajokela/retroshield-arduino) repository.
 
@@ -191,7 +191,7 @@ echo "3.14" | ./retroshield -c 1000000 ../firmware/pascal.z80.bin
 
 ## See Also
 
-- [RetroShield Z80](https://www.interlockelectronics.com/retroshield-z80/) - Hardware platform by Interlock Electronics
+- [RetroShield Z80](https://8bitforce.com/about/) - Hardware platform by 8bitforce
 - [retroshield-hw](https://gitlab.com/8bitforce/retroshield-hw) - Original RetroShield hardware design by Erturk Kocalar
 - [retroshield-arduino](https://gitlab.com/ajokela/retroshield-arduino) - Canonical Arduino sketches for RetroShield
 - [superzazu/z80](https://github.com/superzazu/z80) - Z80 emulation library
