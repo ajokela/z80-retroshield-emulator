@@ -18,8 +18,47 @@
 #include <sys/select.h>
 
 #include "z80.h"
+#include "version.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define MEM_SIZE 0x10000  /* Full 64KB address space */
+
+/* SD Card Emulation ports */
+#define SD_CMD_PORT     0x10
+#define SD_STATUS_PORT  0x11
+#define SD_DATA_PORT    0x12
+#define SD_FNAME_PORT   0x13
+#define SD_SEEK_LO      0x14  /* Seek position low byte */
+#define SD_SEEK_HI      0x15  /* Seek position high byte */
+
+/* SD Commands (match kz80_db) */
+#define SD_CMD_OPEN_READ   0x01
+#define SD_CMD_CREATE      0x02  /* Create new file (truncate) */
+#define SD_CMD_OPEN_APPEND 0x03  /* Open for append */
+#define SD_CMD_SEEK_START  0x04  /* Seek to start of file */
+#define SD_CMD_CLOSE       0x05
+#define SD_CMD_DIR         0x06
+#define SD_CMD_OPEN_RW     0x07  /* Open for read/write (no truncate) */
+#define SD_CMD_SEEK_BYTE   0x08  /* Seek to byte position (set via SD_DATA_PORT first) */
+#define SD_CMD_SEEK_16     0x09  /* Seek to 16-bit position (low byte first via SEEK_PORT) */
+
+/* SD Status bits (match kz80_db) */
+#define SD_STATUS_READY 0x01
+#define SD_STATUS_ERROR 0x02
+#define SD_STATUS_DATA  0x80  /* Data available to read */
+
+/* SD Card emulation state */
+static char sd_filename[256];
+static int sd_filename_pos = 0;
+static FILE *sd_file = NULL;
+static uint8_t sd_status = SD_STATUS_READY;
+static DIR *sd_dir = NULL;
+static const char *sd_storage_dir = "storage";  /* Subdirectory for virtual SD files */
+static char sd_dir_entry[64];
+static int sd_dir_entry_pos = 0;
+static uint16_t sd_seek_pos = 0;  /* Position for byte seek (16-bit) */
 
 /* ROM size - configurable per ROM type */
 static uint16_t rom_size = 0x2000;  /* Default 8KB ROM */
@@ -48,6 +87,9 @@ static z80 cpu;
 static bool debug_mode = false;
 static int max_cycles = 0;
 static bool stdin_eof = false;  /* Track if we've hit EOF on stdin */
+static bool dump_memory = false;
+static uint16_t dump_addr = 0;
+static uint16_t dump_len = 256;
 
 /* Check if input available on stdin (non-blocking) */
 static int kbhit(void) {
@@ -122,6 +164,53 @@ static uint8_t port_in(z80 *z, uint8_t port) {
         return 0;
     }
 
+    /* SD Card emulation ports */
+    else if (port == SD_STATUS_PORT) {
+        uint8_t status = sd_status;
+        /* Add DATA flag if we have data to read */
+        if (sd_file || sd_dir) {
+            status |= SD_STATUS_DATA;
+        }
+        return status;
+    }
+    else if (port == SD_DATA_PORT) {
+        if (sd_file) {
+            int c = fgetc(sd_file);
+            if (c == EOF) {
+                fclose(sd_file);
+                sd_file = NULL;
+                sd_status = SD_STATUS_READY;  /* No more data */
+                return 0;
+            }
+            return (uint8_t)c;
+        } else if (sd_dir) {
+            /* Return directory entry character by character */
+            if (sd_dir_entry[sd_dir_entry_pos] == '\0') {
+                /* Need next directory entry */
+                struct dirent *de;
+                while ((de = readdir(sd_dir)) != NULL) {
+                    /* Skip . and .. */
+                    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                        continue;
+                    /* Copy filename with newline */
+                    snprintf(sd_dir_entry, sizeof(sd_dir_entry), "%s\r\n", de->d_name);
+                    sd_dir_entry_pos = 0;
+                    break;
+                }
+                if (de == NULL) {
+                    /* End of directory */
+                    closedir(sd_dir);
+                    sd_dir = NULL;
+                    sd_status = SD_STATUS_READY;  /* No more data */
+                    return 0;
+                }
+            }
+            /* Return next character of directory entry */
+            return (uint8_t)sd_dir_entry[sd_dir_entry_pos++];
+        }
+        return 0;
+    }
+
     return 0xFF;
 }
 
@@ -144,6 +233,205 @@ static void port_out(z80 *z, uint8_t port, uint8_t val) {
         fflush(stdout);
     }
     /* Control/mode register writes ignored */
+
+    /* SD Card emulation ports */
+    else if (port == SD_CMD_PORT) {
+        switch (val) {
+            case SD_CMD_OPEN_READ: {
+                /* Build full path */
+                char fullpath[512];
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", sd_storage_dir, sd_filename);
+
+                /* Close any existing file */
+                if (sd_file) {
+                    fclose(sd_file);
+                    sd_file = NULL;
+                }
+
+                /* Open for reading */
+                sd_file = fopen(fullpath, "rb");
+
+                if (sd_file) {
+                    sd_status = SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Opened for read: %s\n", fullpath);
+                    }
+                } else {
+                    sd_status = SD_STATUS_ERROR | SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Failed to open: %s (%s)\n", fullpath, strerror(errno));
+                    }
+                }
+                break;
+            }
+            case SD_CMD_CREATE: {
+                /* Create new file (truncate if exists) */
+                char fullpath[512];
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", sd_storage_dir, sd_filename);
+
+                if (sd_file) {
+                    fclose(sd_file);
+                    sd_file = NULL;
+                }
+
+                /* Create storage directory if needed */
+                mkdir(sd_storage_dir, 0755);
+
+                sd_file = fopen(fullpath, "w+b");
+
+                if (sd_file) {
+                    sd_status = SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Created: %s\n", fullpath);
+                    }
+                } else {
+                    sd_status = SD_STATUS_ERROR | SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Failed to create: %s (%s)\n", fullpath, strerror(errno));
+                    }
+                }
+                break;
+            }
+            case SD_CMD_OPEN_APPEND: {
+                /* Open for append (read/write, seek to end) */
+                char fullpath[512];
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", sd_storage_dir, sd_filename);
+
+                if (sd_file) {
+                    fclose(sd_file);
+                    sd_file = NULL;
+                }
+
+                sd_file = fopen(fullpath, "r+b");
+                if (sd_file) {
+                    fseek(sd_file, 0, SEEK_END);
+                    sd_status = SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Opened for append: %s\n", fullpath);
+                    }
+                } else {
+                    sd_status = SD_STATUS_ERROR | SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Failed to open for append: %s (%s)\n", fullpath, strerror(errno));
+                    }
+                }
+                break;
+            }
+            case SD_CMD_SEEK_START:
+                if (sd_file) {
+                    fseek(sd_file, 0, SEEK_SET);
+                    sd_status = SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Seeked to start\n");
+                    }
+                } else {
+                    sd_status = SD_STATUS_ERROR | SD_STATUS_READY;
+                }
+                break;
+            case SD_CMD_OPEN_RW: {
+                /* Open for read/write without truncating */
+                char fullpath[512];
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", sd_storage_dir, sd_filename);
+
+                if (sd_file) {
+                    fclose(sd_file);
+                    sd_file = NULL;
+                }
+
+                sd_file = fopen(fullpath, "r+b");
+                if (sd_file) {
+                    sd_status = SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Opened for read/write: %s\n", fullpath);
+                    }
+                } else {
+                    sd_status = SD_STATUS_ERROR | SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Failed to open for read/write: %s (%s)\n", fullpath, strerror(errno));
+                    }
+                }
+                break;
+            }
+            case SD_CMD_CLOSE:
+                if (sd_file) {
+                    fclose(sd_file);
+                    sd_file = NULL;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Closed file\n");
+                    }
+                }
+                if (sd_dir) {
+                    closedir(sd_dir);
+                    sd_dir = NULL;
+                }
+                sd_status = SD_STATUS_READY;
+                break;
+
+            case SD_CMD_DIR:
+                /* Close any existing directory listing */
+                if (sd_dir) {
+                    closedir(sd_dir);
+                }
+                /* Create storage directory if it doesn't exist */
+                mkdir(sd_storage_dir, 0755);
+
+                sd_dir = opendir(sd_storage_dir);
+                sd_dir_entry_pos = 0;
+                sd_dir_entry[0] = '\0';
+
+                if (sd_dir) {
+                    sd_status = SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] DIR: %s\n", sd_storage_dir);
+                    }
+                } else {
+                    sd_status = SD_STATUS_ERROR | SD_STATUS_READY;
+                }
+                break;
+
+            case SD_CMD_SEEK_BYTE:
+            case SD_CMD_SEEK_16:
+                if (sd_file) {
+                    fseek(sd_file, sd_seek_pos, SEEK_SET);
+                    sd_status = SD_STATUS_READY;
+                    if (debug_mode) {
+                        fprintf(stderr, "[SD] Seeked to position %d\n", sd_seek_pos);
+                    }
+                } else {
+                    sd_status = SD_STATUS_ERROR | SD_STATUS_READY;
+                }
+                break;
+        }
+    }
+    else if (port == SD_DATA_PORT) {
+        if (sd_file) {
+            fputc(val, sd_file);
+        }
+    }
+    else if (port == SD_FNAME_PORT) {
+        if (val == 0) {
+            /* Null terminator - filename complete */
+            sd_filename[sd_filename_pos] = '\0';
+            sd_filename_pos = 0;
+            if (debug_mode) {
+                fprintf(stderr, "[SD] Filename set: %s\n", sd_filename);
+            }
+        } else if (sd_filename_pos < (int)sizeof(sd_filename) - 1) {
+            sd_filename[sd_filename_pos++] = (char)val;
+        }
+    }
+    else if (port == SD_SEEK_LO) {
+        sd_seek_pos = (sd_seek_pos & 0xFF00) | val;
+        if (debug_mode) {
+            fprintf(stderr, "[SD] Seek position low: %d (pos=%d)\n", val, sd_seek_pos);
+        }
+    }
+    else if (port == SD_SEEK_HI) {
+        sd_seek_pos = (sd_seek_pos & 0x00FF) | ((uint16_t)val << 8);
+        if (debug_mode) {
+            fprintf(stderr, "[SD] Seek position high: %d (pos=%d)\n", val, sd_seek_pos);
+        }
+    }
 }
 
 /* Configure ROM size based on ROM type */
@@ -215,11 +503,31 @@ int main(int argc, char *argv[]) {
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            fprintf(stderr, "RetroShield Z80 Emulator v%s\n\n", VERSION);
+            fprintf(stderr, "Usage: %s [-d] [-c cycles] [-m addr [len]] [-s dir] <rom.bin>\n", argv[0]);
+            fprintf(stderr, "  -h, --help      Show this help message\n");
+            fprintf(stderr, "  -d, --debug     Debug mode\n");
+            fprintf(stderr, "  -c cycles       Max cycles to run (0 = unlimited)\n");
+            fprintf(stderr, "  -m addr [len]   Dump memory at addr after run\n");
+            fprintf(stderr, "  -s, --storage   SD card storage directory (default: storage)\n");
+            return 0;
+        }
+        else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_mode = true;
         }
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             max_cycles = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            dump_memory = true;
+            dump_addr = (uint16_t)strtol(argv[++i], NULL, 0);
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                dump_len = (uint16_t)strtol(argv[++i], NULL, 0);
+            }
+        }
+        else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--storage") == 0) && i + 1 < argc) {
+            sd_storage_dir = argv[++i];
         }
         else if (argv[i][0] != '-') {
             rom_file = argv[i];
@@ -227,9 +535,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (!rom_file) {
-        fprintf(stderr, "Usage: %s [-d] [-c cycles] <rom.bin>\n", argv[0]);
-        fprintf(stderr, "  -d         Debug mode\n");
-        fprintf(stderr, "  -c cycles  Max cycles to run (0 = unlimited)\n");
+        fprintf(stderr, "Usage: %s [-d] [-c cycles] [-m addr [len]] [-s dir] <rom.bin>\n", argv[0]);
+        fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
         return 1;
     }
 
@@ -291,6 +598,18 @@ int main(int argc, char *argv[]) {
                         cpu.pc, total_cycles);
             }
             break;
+        }
+    }
+
+    /* Dump memory if requested */
+    if (dump_memory) {
+        fprintf(stderr, "\nMemory dump at 0x%04X:\n", dump_addr);
+        for (uint16_t i = 0; i < dump_len; i += 16) {
+            fprintf(stderr, "%04X: ", dump_addr + i);
+            for (int j = 0; j < 16 && i + j < dump_len; j++) {
+                fprintf(stderr, "%02X ", memory[dump_addr + i + j]);
+            }
+            fprintf(stderr, "\n");
         }
     }
 
